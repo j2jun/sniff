@@ -43,10 +43,13 @@ MAX_BYTES = 2_000_000
 MEDIA_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff", ".gif": b"GIF8",
                ".pdf": b"%PDF", ".ico": b"\x00\x00\x01\x00", ".webp": b"RIFF", ".woff": b"wOFF",
                ".woff2": b"wOF2", ".ttf": b"\x00\x01\x00\x00", ".DS_Store": b"\x00\x00\x00\x01Bud1"}
-# git config keys that make git run a program (some fire on a plain `git status`).
-GIT_EXEC_KEY = re.compile(r"^(fsmonitor|hookspath|sshcommand|pager|editor|askpass|textconv|clean|smudge"
-                          r"|process|helper|program|cmd)\s*=|=\s*\"?!", re.I)
-GIT_SECTION = re.compile(r"^\s*\[([^\]]*)\]\s*")
+# Fail closed on git config: a fresh clone only has these keys. Anything else (fsmonitor, hooksPath,
+# aliases, filters, includes, odd syntax, continuations) gets flagged, so parser tricks can't hide it.
+SAFE_GIT_KEYS = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
+                 "precomposeunicode", "symlinks", "url", "fetch", "remote", "merge", "name", "email"}
+GIT_HEADER = re.compile(r'\s*\[[A-Za-z0-9.-]+(\s+"[^"\\]*")?\]\s*')
+GIT_ENTRY = re.compile(r"\s*([A-Za-z][A-Za-z0-9-]*)\s*=\s*([^\\]*)")
+GIT_SKIP = re.compile(r"\s*([#;].*)?")
 
 
 def clean(s):
@@ -99,22 +102,14 @@ def scan_file(root, path):
 
 
 def scan_git_config(rel, text):
-    """Flag config entries that make git execute something. Parses roughly like git:
-    joins `\\` continuations and allows `[section] key = v` on one line."""
-    out, n, buf, start = [], 0, "", 1
-    for n, raw in enumerate(text.split("\n"), 1):
-        if not buf:
-            start = n
-        if raw.rstrip().endswith("\\"):
-            buf += raw.rstrip()[:-1]
+    """Flag every line of a shipped git config that isn't a plain header, comment, or known-safe key."""
+    out = []
+    for n, line in enumerate(text.split("\n"), 1):
+        if GIT_SKIP.fullmatch(line) or GIT_HEADER.fullmatch(line):
             continue
-        line, buf = buf + raw, ""
-        while (m := GIT_SECTION.match(line)):
-            if m.group(1).strip().lower().startswith("include"):
-                out.append(("HIGH", "git-config-exec", f"{rel}:{start}", "includes another config file git will obey"))
-            line = line[m.end():]
-        if GIT_EXEC_KEY.search(line.strip()):
-            out.append(("HIGH", "git-config-exec", f"{rel}:{start}", f"git will run: {line.strip()!r}"))
+        m = GIT_ENTRY.fullmatch(line)
+        if not (m and m.group(1).lower() in SAFE_GIT_KEYS):
+            out.append(("HIGH", "git-config-exec", f"{rel}:{n}", f"unexpected git setting, may run code: {line.strip()!r}"))
     return out
 
 
@@ -129,7 +124,7 @@ def scan_git(root, gitpath):
                 for h in os.listdir(hooks) if not h.endswith(".sample")]
     for cfg in ("config", "config.worktree"):
         try:
-            with open(os.path.join(gitpath, cfg), encoding="utf-8", errors="ignore") as f:
+            with open(os.path.join(gitpath, cfg), encoding="utf-8-sig", errors="ignore") as f:
                 out += scan_git_config(f"{rel}/{cfg}", f.read())
         except OSError:
             pass
@@ -178,7 +173,7 @@ def test():
             "trojan.py": "access = 'user' # \u202e admin\n",
         }
         os.makedirs(os.path.join(d, ".git"))
-        files[".git/config"] = ("[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
+        files[".git/config"] = ("\ufeff[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
                                  "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n")
         os.makedirs(os.path.join(d, "sub"))
         files["sub/.git"] = "gitdir: /somewhere/else\n"
@@ -197,7 +192,7 @@ def test():
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
-        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 3  # one-line, continued, include; not "name = x"
+        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 4  # one-line, 2 continued lines, include key; not "name = x"
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     print("ok")
 
