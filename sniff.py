@@ -116,7 +116,7 @@ def test():
             "package.json": json.dumps({"scripts": {"postinstall": "node steal.js", "test": "jest"}}),
             "clean.py": "print('hello world')\n",
             "tool": "\x7fELF rest",
-            "trojan.py": "access = 'user' # ‮ admin\n",
+            "trojan.py": "access = 'user' # \u202e admin\n",
         }
         for name, body in files.items():
             with open(os.path.join(d, name), "w") as f:
