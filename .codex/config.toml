@@ -1,0 +1,6 @@
+# Project-scoped Codex config (applies once you trust this project in Codex).
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
