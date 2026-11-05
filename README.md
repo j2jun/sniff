@@ -11,7 +11,7 @@ alongside the code you meant to run.
 `sniff` reads a repo **without running anything** and tells you what it would touch.
 
 ```sh
-python3 sniff.py ./assignment     # exit 1 if anything HIGH
+python3 sniff.py ./assignment     # scan; exit 1 if anything HIGH
 python3 sniff.py --test           # self-check
 ```
 
@@ -32,12 +32,18 @@ HIGH   npm-install-hook  package.json  - runs on npm install: 'node steal.js'
 | `npm-install-hook`, `setup-py`, `git-hook` | Code that runs on `npm install`, `pip install`, or `git commit` |
 | `binary`, `hidden-unicode` | Prebuilt executables and Trojan Source characters |
 
-A clean result doesn't make a repo safe. Next, run it in a sandbox: no network, no home
-directory, no credentials.
+A clean result doesn't make a repo safe, so run it in the sandbox next:
 
 ```sh
-docker run --rm -it --network none --read-only --tmpfs /tmp -v "$PWD/assignment:/work:ro" -w /work python:3.12-slim bash
+python3 sniff.py run ./assignment            # scan, then a shell in a locked-down container
+python3 sniff.py run ./assignment make test  # or run one command
 ```
+
+The container has no network, a read-only root filesystem, no capabilities, and no host home
+directory or credentials. It runs as `nobody` with memory and process limits. Your repo is mounted
+read-only and copied into a throwaway tmpfs, so nothing the code writes survives. CI proves these
+properties on every push (`.github/sandbox-check.sh`). With no network, `pip install` won't work;
+that's deliberate.
 
 ## Agent setup
 - `AGENTS.md`: the single source of agent instructions (Codex reads it natively)

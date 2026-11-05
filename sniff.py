@@ -1,8 +1,9 @@
 """sniff: flag what an untrusted repo (e.g. a take-home assignment) would do, BEFORE you run it.
 
 Static and read-only: it never executes, imports, or installs anything from the target.
-Run: python3 sniff.py <path>     Self-check: python3 sniff.py --test
-Exit code 1 if any HIGH finding, so it can gate CI.
+Scan:    python3 sniff.py <path>              (exit 1 on any HIGH finding, so it can gate CI)
+Sandbox: python3 sniff.py run <path> [cmd]    (scan, then open a locked-down Docker shell on a copy)
+Check:   python3 sniff.py --test
 """
 import json
 import os
@@ -156,7 +157,37 @@ def scan(root):
     return sorted(findings, key=lambda x: (x[0] != "HIGH", x[2]))
 
 
+IMAGE = "python:3.12-slim"
+
+
+def sandbox_cmd(path, cmd="bash", tty=False):
+    """docker argv for running untrusted code: no network, no host home or credentials, no privileges.
+    The repo is mounted read-only and copied into a throwaway tmpfs, so nothing it writes survives."""
+    # ponytail: no network means no `pip install`; add an opt-in egress proxy if assignments need deps.
+    return ["docker", "run", "--rm", "-i"] + (["-t"] if tty else []) + [
+        "--network", "none", "--read-only", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges", "--pids-limit", "256", "--memory", "1g",
+        "--user", "65534:65534", "-e", "HOME=/tmp",
+        "--tmpfs", "/tmp:rw,exec,size=256m,mode=1777", "--tmpfs", "/work:rw,exec,size=1g,mode=1777",
+        "-v", f"{os.path.abspath(path)}:/src:ro", "-w", "/work",
+        IMAGE, "sh", "-c", f"cp -r /src/. /work && exec {cmd}"]
+
+
+def run(path, cmd):
+    if ":" in os.path.abspath(path):  # would be parsed as part of docker's -v src:dst:mode
+        sys.exit("path contains ':'; rename it first")
+    main(path)
+    print(f"\nOpening sandbox (no network, read-only, throwaway copy): {cmd}\n", file=sys.stderr)
+    argv = sandbox_cmd(path, cmd, sys.stdin.isatty())
+    try:
+        os.execvp(argv[0], argv)
+    except FileNotFoundError:
+        sys.exit("docker not found; install Docker Desktop or run the command in README by hand")
+
+
 def main(root):
+    if not os.path.isdir(root):
+        sys.exit(f"not a directory: {root}")
     findings = scan(root)
     for sev, rid, where, why in findings:
         print(f"{sev:6} {rid:17} {clean(where)}  - {clean(why)}")
@@ -201,12 +232,18 @@ def test():
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
         assert sum(f[1] == "git-config-exec" for f in scan(d)) == 7  # one-line, 2 continued, include, alias, ext::, quoted EXT::; not name = x or https url
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
+    argv = sandbox_cmd("x", "make test")
+    for flag in ["--network none", "--read-only", "--cap-drop ALL", "no-new-privileges", "--user 65534:65534"]:
+        assert flag in " ".join(argv), flag
+    assert argv[-1].endswith("exec make test") and f"{os.path.abspath('x')}:/src:ro" in argv
     print("ok")
 
 
 if __name__ == "__main__":
     if "--test" in sys.argv:
         test()
+    elif len(sys.argv) >= 3 and sys.argv[1] == "run":
+        run(sys.argv[2], " ".join(sys.argv[3:]) or "bash")
     elif len(sys.argv) == 2:
         sys.exit(main(sys.argv[1]))
     else:

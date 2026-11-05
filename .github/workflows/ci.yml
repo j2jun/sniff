@@ -1,0 +1,12 @@
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 sniff.py --test
+      - name: Sandbox is isolated
+        run: python3 sniff.py run . sh /src/.github/sandbox-check.sh | tee out.txt && grep -qx ISOLATED out.txt
