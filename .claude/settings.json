@@ -4,7 +4,8 @@
       "Bash(python3 audit.py)",
       "Bash(python3 audit.py --test)",
       "Bash(git status)",
-      "Bash(git diff *)"
+      "Bash(git diff)",
+      "Bash(git diff --stat)"
     ],
     "deny": [
       "Read(./.env)",
