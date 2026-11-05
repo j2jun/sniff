@@ -11,6 +11,13 @@ run before or alongside the code you meant to run.
 
 `sniff` reads a repo **without running anything** and tells you what it would touch.
 
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| Scan | ✅ | ✅ | ✅ (use `python` instead of `python3`) |
+| Sandbox (`run`) | ✅ Docker Desktop | ✅ Docker | ✅ Docker Desktop with Linux containers |
+
+CI runs the self-check on all three operating systems, and proves the sandbox's isolation on Linux.
+
 ```sh
 python3 sniff.py ./assignment     # scan; exit 1 if anything HIGH
 python3 sniff.py --test           # self-check
@@ -26,9 +33,10 @@ HIGH   npm-install-hook  package.json  - runs on npm install: 'node steal.js'
 | Rule | Why |
 |---|---|
 | `pipe-to-shell` | `curl ... \| sh` runs code you never read |
-| `shell-profile`, `toolchain-shim` | PATH hijack and persistence through `.zshrc` and `~/.pyenv/shims` |
-| `persistence` | LaunchAgents, cron, and systemd entries survive reboots |
-| `credential-path` | Reads `~/.ssh`, `~/.aws`, kube and docker configs, Keychain |
+| `shell-profile`, `toolchain-shim` | PATH hijack and persistence through `.zshrc`, the PowerShell `$PROFILE`, and pyenv shims |
+| `persistence`, `windows-persistence` | LaunchAgents, cron, systemd, Run keys, scheduled tasks, and services survive reboots |
+| `ps-download-exec`, `encoded-powershell` | `iwr ... \| iex` and `powershell -enc`: the Windows versions of `curl \| sh` |
+| `credential-path` | Reads `~/.ssh`, `~/.aws`, kube and docker configs, Keychain, Windows Credential Manager, browser logins |
 | `decode-exec`, `dynamic-exec`, `long-blob` | Obfuscated payloads |
 | `npm-install-hook`, `setup-py`, `git-hook` | Code that runs on `npm install`, `pip install`, or `git commit` |
 | `binary`, `hidden-unicode` | Prebuilt executables and Trojan Source characters |

