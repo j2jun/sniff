@@ -47,7 +47,8 @@ def match_vendors(names):
 
 def sh(*cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return (r.stdout + r.stderr).strip()
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"(unavailable: {e})"
 
