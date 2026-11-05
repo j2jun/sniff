@@ -2,11 +2,12 @@
 
 **Sniff out malicious take-home assignments before they run.**
 
-A widely shared 2026 story describes a crypto-exchange breach that started with a fake job
-interview. The "assignment" quietly replaced a pyenv file, and that foothold led to a stolen
-deploy token. The attack pattern is real and well documented: fake-recruiter malware hides in
-install hooks, shell profiles, toolchain shims, and obfuscated blobs, all of which run before or
-alongside the code you meant to run.
+The [$6.3B Binance heist](https://www.bleepingcomputer.com/news/security/binance-says-fake-job-interview-led-to-63-billion-crypto-heist/)
+(Oct 2026, attributed to North Korea's TraderTraitor group) started with a fake job interview. The
+take-home "assignment" ran malicious setup code that swapped a pyenv component on a work laptop,
+and that foothold led to a container deployment token and the wallet signing service. Fake-recruiter
+malware hides in install hooks, shell profiles, toolchain shims, and obfuscated blobs, all of which
+run before or alongside the code you meant to run.
 
 `sniff` reads a repo **without running anything** and tells you what it would touch.
 
