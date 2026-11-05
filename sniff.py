@@ -264,7 +264,11 @@ def test():
     for flag in ["--network none", "--read-only", "--cap-drop ALL", "no-new-privileges", "--user 65534:65534"]:
         assert flag in " ".join(argv), flag
     assert argv[-1].endswith("exec make test") and f"{os.path.abspath('x')}:/src:ro" in argv
-    assert path_ok("x") and not path_ok(os.path.join("x", "a:b"))
+    assert path_ok("x")
+    if os.name == "nt":  # the old bug: every Windows path has a drive-letter colon
+        assert path_ok(r"C:\Users\me\repo")
+    else:  # ':' can't appear in Windows file names, so only POSIX can hit this
+        assert not path_ok("/tmp/a:b")
     print("ok")
 
 
