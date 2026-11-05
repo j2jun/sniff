@@ -1,8 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3 audit.py)",
-      "Bash(python3 audit.py --test)",
+      "Bash(python3 sniff.py *)",
+      "Bash(python3 sniff.py --test)",
       "Bash(git status)",
       "Bash(git diff)",
       "Bash(git diff --stat)"
